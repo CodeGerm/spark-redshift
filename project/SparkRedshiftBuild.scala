@@ -155,10 +155,15 @@ object SparkRedshiftBuild extends Build {
        * Release settings *
        ********************/
 
-      publishMavenStyle := true,
-      releaseCrossBuild := true,
+       publishTo := {
+         val nexus = "http://10.0.1.58:8081/nexus/"
+         if (isSnapshot.value)
+           Some("snapshots" at nexus + "content/repositories/thirdpartysnapshots")
+         else
+           Some("releases"  at nexus + "content/repositories/thirdparty")
+       }
+
       licenses += ("Apache-2.0", url("http://www.apache.org/licenses/LICENSE-2.0")),
-      releasePublishArtifactsAction := PgpKeys.publishSigned.value,
 
       pomExtra :=
         <url>https://github.com/databricks/spark-redshift</url>
@@ -182,22 +187,6 @@ object SparkRedshiftBuild extends Build {
             <name>Michael Armbrust</name>
             <url>https://github.com/marmbrus</url>
           </developer>
-        </developers>,
-
-      bintrayReleaseOnPublish in ThisBuild := false,
-
-      // Add publishing to spark packages as another step.
-      releaseProcess := Seq[ReleaseStep](
-        checkSnapshotDependencies,
-        inquireVersions,
-        runTest,
-        setReleaseVersion,
-        commitReleaseVersion,
-        tagRelease,
-        publishArtifacts,
-        setNextVersion,
-        commitNextVersion,
-        pushChanges
-      )
+        </developers>
     )
 }

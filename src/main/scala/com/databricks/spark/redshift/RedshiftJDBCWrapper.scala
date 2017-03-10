@@ -30,12 +30,14 @@ import scala.util.Try
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.types._
 import org.slf4j.LoggerFactory
-
+import scala.annotation.tailrec
 /**
  * Shim which exposes some JDBC helper functions. Most of this code is copied from Spark SQL, with
  * minor modifications for Redshift-specific features and limitations.
  */
 private[redshift] class JDBCWrapper {
+
+  type StatementRunner[T] = PreparedStatement => T
 
   private val log = LoggerFactory.getLogger(getClass)
 
@@ -126,7 +128,7 @@ private[redshift] class JDBCWrapper {
    *         count or there is no result
    */
   def executeInterruptibly(statement: PreparedStatement): Boolean = {
-    executeInterruptibly(statement, _.execute())
+    executeInterruptibly(statement, executeWithRetry(_.execute()))
   }
 
   /**
@@ -137,7 +139,7 @@ private[redshift] class JDBCWrapper {
    *         query; never <code>null</code>
    */
   def executeQueryInterruptibly(statement: PreparedStatement): ResultSet = {
-    executeInterruptibly(statement, _.executeQuery())
+    executeInterruptibly(statement, executeWithRetry(_.executeQuery()))
   }
 
   private def executeInterruptibly[T](
@@ -157,6 +159,29 @@ private[redshift] class JDBCWrapper {
             throw e
         }
     }
+  }
+
+  private def executeWithRetry[T](op: StatementRunner[T]): StatementRunner[T] = {
+    case statement =>
+      executeWithRetry(op, statement, 3)
+  }
+
+  @tailrec
+  private def executeWithRetry[T](op: StatementRunner[T],
+                                  statement: PreparedStatement,
+                                  retryCount: Int): T = {
+      try {
+        op(statement)
+      } catch {
+        case e: SQLException => {
+          if (retryCount <= 0) throw e
+          else {
+            Thread.sleep(10 * 1000) // wait 10 seconds
+            log.warn("Exception occurred while executing the query, retrying")
+            executeWithRetry(op, statement, retryCount - 1)
+          }
+        }
+      }
   }
 
   /**
