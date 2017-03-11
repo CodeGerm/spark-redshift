@@ -161,7 +161,7 @@ object SparkRedshiftBuild extends Build {
            Some("snapshots" at nexus + "content/repositories/thirdpartysnapshots")
          else
            Some("releases"  at nexus + "content/repositories/thirdparty")
-       }
+       },
 
       licenses += ("Apache-2.0", url("http://www.apache.org/licenses/LICENSE-2.0")),
 
