@@ -163,7 +163,7 @@ private[redshift] class JDBCWrapper {
 
   private def executeWithRetry[T](op: StatementRunner[T]): StatementRunner[T] = {
     case statement =>
-      executeWithRetry(op, statement, 3)
+      executeWithRetry(op, statement, 10)
   }
 
   @tailrec
@@ -176,7 +176,7 @@ private[redshift] class JDBCWrapper {
         case e: SQLException => {
           if (retryCount <= 0) throw e
           else {
-            Thread.sleep(10 * 1000) // wait 10 seconds
+            Thread.sleep(1 * 1000) // wait 1 second
             log.warn("Exception occurred while executing the query, retrying")
             executeWithRetry(op, statement, retryCount - 1)
           }

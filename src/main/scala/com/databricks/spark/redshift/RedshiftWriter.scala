@@ -280,39 +280,64 @@ private[redshift] class RedshiftWriter(
     if (nonEmptyPartitions.value.isEmpty) {
       None
     } else {
-      // See https://docs.aws.amazon.com/redshift/latest/dg/loading-data-files-using-manifest.html
-      // for a description of the manifest file format. The URLs in this manifest must be absolute
-      // and complete.
-
-      // The saved filenames depend on the spark-avro version. In spark-avro 1.0.0, the write
-      // path uses SparkContext.saveAsHadoopFile(), which produces filenames of the form
-      // part-XXXXX.avro. In spark-avro 2.0.0+, the partition filenames are of the form
-      // part-r-XXXXX-UUID.avro.
-      val fs = FileSystem.get(URI.create(tempDir), sqlContext.sparkContext.hadoopConfiguration)
-      val partitionIdRegex = "^part-(?:r-)?(\\d+)[^\\d+].*$".r
-      val filesToLoad: Seq[String] = {
-        val nonEmptyPartitionIds = nonEmptyPartitions.value.toSet
-        fs.listStatus(new Path(tempDir)).map(_.getPath.getName).collect {
-          case file @ partitionIdRegex(id) if nonEmptyPartitionIds.contains(id.toInt) => file
-        }
-      }
-      // It's possible that tempDir contains AWS access keys. We shouldn't save those credentials to
-      // S3, so let's first sanitize `tempdir` and make sure that it uses the s3:// scheme:
-      val sanitizedTempDir = Utils.fixS3Url(
-        Utils.removeCredentialsFromURI(URI.create(tempDir)).toString).stripSuffix("/")
-      val manifestEntries = filesToLoad.map { file =>
-        s"""{"url":"$sanitizedTempDir/$file", "mandatory":true}"""
-      }
-      val manifest = s"""{"entries": [${manifestEntries.mkString(",\n")}]}"""
-      val manifestPath = sanitizedTempDir + "/manifest.json"
-      val fsDataOut = fs.create(new Path(manifestPath))
-      try {
-        fsDataOut.write(manifest.getBytes("utf-8"))
-      } finally {
-        fsDataOut.close()
-      }
-      Some(manifestPath)
+      generateManifestWithRetry(sqlContext, nonEmptyPartitions.value, tempDir)
     }
+  }
+
+  def generateManifestWithRetry(sqlContext: SQLContext,
+                                partitionSet: mutable.HashSet[Int],
+                                tempDir: String,
+                                retryCount : Int = 30): Option[String] = {
+    // See https://docs.aws.amazon.com/redshift/latest/dg/loading-data-files-using-manifest.html
+    // for a description of the manifest file format. The URLs in this manifest must be absolute
+    // and complete.
+
+    // The saved filenames depend on the spark-avro version. In spark-avro 1.0.0, the write
+    // path uses SparkContext.saveAsHadoopFile(), which produces filenames of the form
+    // part-XXXXX.avro. In spark-avro 2.0.0+, the partition filenames are of the form
+    // part-r-XXXXX-UUID.avro.
+    val fs = FileSystem.get(URI.create(tempDir), sqlContext.sparkContext.hadoopConfiguration)
+    val partitionIdRegex = "^part-(?:r-)?(\\d+)[^\\d+].*$".r
+    val nonEmptyPartitionIds = partitionSet.toSet
+    def listFilesToLoad : Seq[String] = {
+      fs.listStatus(new Path(tempDir)).map(_.getPath.getName).collect {
+        case file@partitionIdRegex(id) if nonEmptyPartitionIds.contains(id.toInt) => file
+      }
+    }
+
+    var count = retryCount
+    var filesToLoad: Seq[String] = listFilesToLoad
+    while (nonEmptyPartitionIds.size != filesToLoad.size ) {
+      if (count >=0) {
+        log.warn("Retry Non-empty partition number does not match temp file counts, " +
+          s"partitions = ${nonEmptyPartitionIds.size}, files =${filesToLoad.size}")
+      } else {
+        log.error("Non-empty partition number does not match temp file counts, " +
+          s"partitions = ${nonEmptyPartitionIds.size}, files =${filesToLoad.size}")
+        throw new IllegalStateException(
+          "Non-empty partition number does not match temp file counts")
+      }
+      Thread.sleep(1 * 1000) // wait 10 seconds
+      filesToLoad = listFilesToLoad
+      count = count -1
+    }
+
+    // It's possible that tempDir contains AWS access keys. We shouldn't save those credentials to
+    // S3, so let's first sanitize `tempdir` and make sure that it uses the s3:// scheme:
+    val sanitizedTempDir = Utils.fixS3Url(
+      Utils.removeCredentialsFromURI(URI.create(tempDir)).toString).stripSuffix("/")
+    val manifestEntries = filesToLoad.map { file =>
+      s"""{"url":"$sanitizedTempDir/$file", "mandatory":true}"""
+    }
+    val manifest = s"""{"entries": [${manifestEntries.mkString(",\n")}]}"""
+    val manifestPath = sanitizedTempDir + "/manifest.json"
+    val fsDataOut = fs.create(new Path(manifestPath))
+    try {
+      fsDataOut.write(manifest.getBytes("utf-8"))
+    } finally {
+      fsDataOut.close()
+    }
+    Some(manifestPath)
   }
 
   /**

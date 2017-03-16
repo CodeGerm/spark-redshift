@@ -1,1 +1,1 @@
-version in ThisBuild := "1.1.0-codegerm"
+version in ThisBuild := "1.1.1-codegerm"
