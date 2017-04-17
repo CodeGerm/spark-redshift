@@ -63,6 +63,8 @@ private[redshift] class RedshiftWriter(
 
   private val log = LoggerFactory.getLogger(getClass)
 
+  log.info("CodeGerm Version 1.1.12")
+
   /**
    * Generate CREATE TABLE statement for Redshift
    */
@@ -93,8 +95,12 @@ private[redshift] class RedshiftWriter(
       manifestUrl: String): String = {
     val credsString: String = AWSCredentialsUtils.getRedshiftCredentialsString(params, creds)
     val fixedUrl = Utils.fixS3Url(manifestUrl)
+    val format = params.tempFormat match {
+      case "AVRO" => "AVRO 'auto'"
+      case csv if csv == "CSV" || csv == "CSV GZIP" => csv + s" NULL AS '${params.nullString}'"
+    }
     s"COPY ${params.table.get} FROM '$fixedUrl' CREDENTIALS '$credsString' FORMAT AS " +
-      s"AVRO 'auto' manifest ${params.extraCopyOptions}"
+      s"${format} manifest ${params.extraCopyOptions}"
   }
 
   /**
@@ -141,7 +147,8 @@ private[redshift] class RedshiftWriter(
         jdbcWrapper.executeInterruptibly(conn.prepareStatement(copyStatement))
       } catch {
         case e: SQLException =>
-          log.error("SQLException thrown while running COPY query; will attempt to retrieve " +
+          log.error("SQLException thrown while running COPY query; will attempt " +
+            "to retrieve " +
             "more information by querying the STL_LOAD_ERRORS table", e)
           // Try to query Redshift's STL_LOAD_ERRORS table to figure out why the load failed.
           // See http://docs.aws.amazon.com/redshift/latest/dg/r_STL_LOAD_ERRORS.html for details.
@@ -204,7 +211,9 @@ private[redshift] class RedshiftWriter(
   private def unloadData(
       sqlContext: SQLContext,
       data: DataFrame,
-      tempDir: String): Option[String] = {
+      tempDir: String,
+      tempFormat: String,
+      nullString: String): Option[String] = {
     // spark-avro does not support Date types. In addition, it converts Timestamps into longs
     // (milliseconds since the Unix epoch). Redshift is capable of loading timestamps in
     // 'epochmillisecs' format but there's no equivalent format for dates. To work around this, we
@@ -272,54 +281,79 @@ private[redshift] class RedshiftWriter(
       }
     )
 
-    sqlContext.createDataFrame(convertedRows, convertedSchema)
-      .write
-      .format("com.databricks.spark.avro")
-      .save(tempDir)
+    val writer = sqlContext.createDataFrame(convertedRows, convertedSchema).write
+    (tempFormat match {
+      case "AVRO" =>
+        writer.format("com.databricks.spark.avro")
+      case "CSV" =>
+        writer.format("com.databricks.spark.csv")
+          .option("escape", "\\")
+          .option("nullValue", nullString)
+          .option("quote","\"")
+      case "CSV GZIP" =>
+        writer.format("com.databricks.spark.csv")
+          .option("escape", "\\")
+          .option("nullValue", nullString)
+          .option("codec", "org.apache.hadoop.io.compress.GzipCodec")
+          .option("quote","\"")
+    }).save(tempDir)
 
     if (nonEmptyPartitions.value.isEmpty) {
       None
     } else {
-      generateManifestWithRetry(sqlContext, nonEmptyPartitions.value, tempDir)
+      generateManifestWithRetry(sqlContext, nonEmptyPartitions.value, tempDir, tempFormat)
     }
   }
 
   def generateManifestWithRetry(sqlContext: SQLContext,
                                 partitionSet: mutable.HashSet[Int],
                                 tempDir: String,
+                                tempFormat: String,
                                 retryCount : Int = 30): Option[String] = {
     // See https://docs.aws.amazon.com/redshift/latest/dg/loading-data-files-using-manifest.html
     // for a description of the manifest file format. The URLs in this manifest must be absolute
     // and complete.
+
+    // The partition filenames are of the form part-r-XXXXX-UUID.fileExtension.
 
     // The saved filenames depend on the spark-avro version. In spark-avro 1.0.0, the write
     // path uses SparkContext.saveAsHadoopFile(), which produces filenames of the form
     // part-XXXXX.avro. In spark-avro 2.0.0+, the partition filenames are of the form
     // part-r-XXXXX-UUID.avro.
     val fs = FileSystem.get(URI.create(tempDir), sqlContext.sparkContext.hadoopConfiguration)
-    val partitionIdRegex = "^part-(?:r-)?(\\d+)[^\\d+].*$".r
+    val partitionIdRegex = "^part-(?:r-)?(\\d+)[^\\d+]?(.*$)".r
     val nonEmptyPartitionIds = partitionSet.toSet
     def listFilesToLoad : Seq[String] = {
       fs.listStatus(new Path(tempDir)).map(_.getPath.getName).collect {
-        case file@partitionIdRegex(id) if nonEmptyPartitionIds.contains(id.toInt) => file
+        case file@partitionIdRegex(id,suffix) if nonEmptyPartitionIds.contains(id.toInt) => file
       }
     }
 
     var count = retryCount
     var filesToLoad: Seq[String] = listFilesToLoad
-    while (nonEmptyPartitionIds.size != filesToLoad.size ) {
-      if (count >=0) {
-        log.warn("Retry Non-empty partition number does not match temp file counts, " +
-          s"partitions = ${nonEmptyPartitionIds.size}, files =${filesToLoad.size}")
-      } else {
-        log.error("Non-empty partition number does not match temp file counts, " +
-          s"partitions = ${nonEmptyPartitionIds.size}, files =${filesToLoad.size}")
-        throw new IllegalStateException(
-          "Non-empty partition number does not match temp file counts")
-      }
-      Thread.sleep(1 * 1000) // wait 10 seconds
-      filesToLoad = listFilesToLoad
-      count = count -1
+    if ("AVRO".equals(tempFormat)){
+        while (nonEmptyPartitionIds.size != filesToLoad.size) {
+          if (count >= 0) {
+            log.warn("Retry Non-empty partition number does not match temp file counts, " +
+              s"partitions = ${
+                nonEmptyPartitionIds.size
+              }, files =${
+                filesToLoad.size
+              }")
+          } else {
+            log.error("Non-empty partition number does not match temp file counts, " +
+              s"partitions = ${
+                nonEmptyPartitionIds.size
+              }, files =${
+                filesToLoad.size
+              }")
+            throw new IllegalStateException(
+              "Non-empty partition number does not match temp file counts")
+          }
+          Thread.sleep(1 * 1000) // wait 10 seconds
+          filesToLoad = listFilesToLoad
+          count = count - 1
+        }
     }
 
     // It's possible that tempDir contains AWS access keys. We shouldn't save those credentials to
@@ -341,7 +375,7 @@ private[redshift] class RedshiftWriter(
   }
 
   /**
-   * Write a DataFrame to a Redshift table, using S3 and Avro serialization
+   * Write a DataFrame to a Redshift table, using S3 and Avro or CSV serialization
    */
   def saveToRedshift(
       sqlContext: SQLContext,
@@ -358,17 +392,44 @@ private[redshift] class RedshiftWriter(
         "drop the target table yourself. For more details on this deprecation, see" +
         "https://github.com/databricks/spark-redshift/pull/157")
     }
-
     val creds: AWSCredentials =
       AWSCredentialsUtils.load(params, sqlContext.sparkContext.hadoopConfiguration)
+
+    // When using the Avro tempformat, log an informative error message in case any column names
+    // are unsupported by Avro's schema validation:
+    if (params.tempFormat == "AVRO") {
+      for (fieldName <- data.schema.fieldNames) {
+        // The following logic is based on Avro's Schema.validateName() method:
+        val firstChar = fieldName.charAt(0)
+        val isValid = (firstChar.isLetter || firstChar == '_') && fieldName.tail.forall { c =>
+          c.isLetterOrDigit || c == '_'
+        }
+        if (!isValid) {
+          throw new IllegalArgumentException(
+            s"The field name '$fieldName' is not supported when using the Avro tempformat. " +
+              "Try using the CSV tempformat  instead. For more details, see " +
+              "https://github.com/databricks/spark-redshift/issues/84")
+        }
+      }
+    }
 
     Utils.assertThatFileSystemIsNotS3BlockFileSystem(
       new URI(params.rootTempDir), sqlContext.sparkContext.hadoopConfiguration)
 
     Utils.checkThatBucketHasObjectLifecycleConfiguration(params.rootTempDir, s3ClientFactory(creds))
 
+    val startTime = System.currentTimeMillis()
+
     // Save the table's rows to S3:
-    val manifestUrl = unloadData(sqlContext, data, params.createPerQueryTempDir())
+    val manifestUrl = unloadData(
+      sqlContext,
+      data,
+      tempDir = params.createPerQueryTempDir(),
+      tempFormat = params.tempFormat,
+      nullString = params.nullString)
+
+    val finishS3 = System.currentTimeMillis()
+
     val conn = jdbcWrapper.getConnector(params.jdbcDriver, params.jdbcUrl, params.credentials)
     conn.setAutoCommit(false)
     try {
@@ -399,6 +460,8 @@ private[redshift] class RedshiftWriter(
     } finally {
       conn.close()
     }
+    val finishCopy = System.currentTimeMillis()
+    log.info ("Redshift loading metrics: s3-copy= " + (finishS3 - startTime) + ", redshift-copy= " + (finishCopy - finishS3))
   }
 }
 

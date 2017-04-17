@@ -20,7 +20,7 @@ import java.io.{ByteArrayInputStream, File}
 import java.net.URI
 
 import com.amazonaws.services.s3.AmazonS3Client
-import com.amazonaws.services.s3.model.{S3ObjectInputStream, S3Object, BucketLifecycleConfiguration}
+import com.amazonaws.services.s3.model.{BucketLifecycleConfiguration, ObjectListing, S3Object, S3ObjectInputStream}
 import com.amazonaws.services.s3.model.BucketLifecycleConfiguration.Rule
 import org.apache.http.client.methods.HttpRequestBase
 import org.mockito.Matchers._
@@ -28,18 +28,16 @@ import org.mockito.Mockito
 import org.mockito.Mockito.when
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.mapreduce.InputFormat
-import org.apache.hadoop.fs.{Path, FileSystem}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.apache.hadoop.fs.s3native.S3NInMemoryFileSystem
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
-import org.scalatest.{BeforeAndAfterEach, BeforeAndAfterAll, Matchers}
-
+import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, Matchers}
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
-
 import com.databricks.spark.redshift.Parameters.MergedParameters
 
 private class TestContext extends SparkContext("local", "RedshiftSourceSuite") {
@@ -84,11 +82,22 @@ class RedshiftSourceSuite
 
   private val s3TempDir: String = "s3n://test-bucket/temp-dir/"
 
+  private var s3FileStatus: Array[FileStatus] = _
+
   // Parameters common to most tests. Some parameters are overridden in specific tests.
   private def defaultParams: Map[String, String] = Map(
     "url" -> "jdbc:redshift://foo/bar?user=user&password=password",
     "tempdir" -> s3TempDir,
     "dbtable" -> "test_table")
+
+  private var s3Manifest: String =
+    """
+      | {
+      |   "entries": [
+      |     { "url": "s3://test-bucket/some-uuid(a-hack-for-mocking)/part-00000" }
+      |    ]
+      | }
+    """.stripMargin
 
   override def beforeAll(): Unit = {
     super.beforeAll()
@@ -122,15 +131,7 @@ class RedshiftSourceSuite
     when(mockManifest.getObjectContent).thenAnswer {
       new Answer[S3ObjectInputStream] {
         override def answer(invocationOnMock: InvocationOnMock): S3ObjectInputStream = {
-          val manifest =
-            """
-              | {
-              |   "entries": [
-              |     { "url": "s3://test-bucket/some-uuid(a-hack-for-mocking)/part-00000" }
-              |    ]
-              | }
-            """.stripMargin
-          val is = new ByteArrayInputStream(manifest.getBytes("UTF-8"))
+          val is = new ByteArrayInputStream(s3Manifest.getBytes("UTF-8"))
           new S3ObjectInputStream(
             is,
             Mockito.mock(classOf[HttpRequestBase], Mockito.RETURNS_SMART_NULLS))
@@ -552,4 +553,45 @@ class RedshiftSourceSuite
     }
     assert(e.getMessage.contains("Block FileSystem"))
   }
+
+  test("S3 consistency causes retry failure") {
+    val mockRedshift = new MockRedshift(
+      defaultParams("url"),
+      Map(TableName.parseFromEscaped(defaultParams("dbtable")).toString -> null))
+
+    val testDf =
+      testSqlContext.createDataFrame(
+        sc.parallelize(TestUtils.expectedData, 2), TestUtils.testSchema
+      )
+
+    val source = new DefaultSource(mockRedshift.jdbcWrapper, _ => mockS3Client)
+
+
+    val savedDf =
+        source.createRelation(testSqlContext, SaveMode.Append, defaultParams, testDf)
+
+    val dir = s3FileSystem.listStatus(new Path(s3TempDir)).head.getPath.toUri.toString
+
+    source.createRelation(testSqlContext, SaveMode.Append, defaultParams, testDf)
+
+
+    // This test is "appending" to an empty table, so we expect all our test data to be
+    // the only content in the returned data frame.
+    // The data should have been written to a random subdirectory of `tempdir`. Since we clear
+    // `tempdir` between every unit test, there should only be one directory here.
+
+     val written1 = testSqlContext.read.format("com.databricks.spark.avro").load(dir)
+    checkAnswer(written1, TestUtils.expectedDataWithConvertedTimesAndDates)
+
+    // Make sure we wrote the data out ready for Redshift load, in the expected formats.
+    // The data should have been written to a random subdirectory of `tempdir`. Since we clear
+    // `tempdir` between every unit test, there should only be one directory here.
+    assert(s3FileSystem.listStatus(new Path(s3TempDir)).length === 1)
+    val dirWithAvroFiles = s3FileSystem.listStatus(new Path(s3TempDir)).head.getPath.toUri.toString
+    val written = testSqlContext.read.format("com.databricks.spark.avro").load(dir)
+    checkAnswer(written1, TestUtils.expectedDataWithConvertedTimesAndDates)
+    mockRedshift.verifyThatConnectionsWereClosed()
+
+      }
+
 }
